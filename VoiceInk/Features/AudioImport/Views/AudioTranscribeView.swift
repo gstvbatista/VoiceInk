@@ -45,13 +45,6 @@ struct AudioTranscribeView: View {
                 transcriptionManager.addToQueue(urls: [url])
             }
         }
-        .onChange(of: transcriptionManager.lastCompletedItemId) { _, newId in
-            if let newId {
-                withAnimation(.easeInOut(duration: 0.3)) {
-                    expandedItemId = newId
-                }
-            }
-        }
     }
 
     // MARK: - Empty State

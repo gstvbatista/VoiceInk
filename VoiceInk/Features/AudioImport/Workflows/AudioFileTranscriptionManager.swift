@@ -150,8 +150,8 @@ class AudioTranscriptionManager: ObservableObject {
 
     /// Whether the model's engine emits word-level timestamps — the requirement
     /// for any speaker attribution. Engines without them keep the plain
-    /// single-pass transcription path.
-    private static func engineSupportsWordTimings(_ model: any TranscriptionModel) -> Bool {
+    /// single-pass transcription path. Shared with the headless CLI.
+    static func engineSupportsWordTimings(_ model: any TranscriptionModel) -> Bool {
         switch model.provider {
         case .whisper, .nativeApple:
             return true
@@ -164,7 +164,7 @@ class AudioTranscriptionManager: ObservableObject {
 
     /// Peak-normalizes one channel so a quiet call participant gets full ASR
     /// signal level regardless of how loud the other channel is.
-    private static func normalized(_ samples: [Float]) -> [Float] {
+    static func normalized(_ samples: [Float]) -> [Float] {
         let maxSample = samples.map(abs).max() ?? 0
         guard maxSample > 0 else { return samples }
         return samples.map { $0 / maxSample }
@@ -174,7 +174,7 @@ class AudioTranscriptionManager: ObservableObject {
     /// channel they came from — hallucinated words sit on top of silence.
     /// The span is padded and checked frame by frame so slightly-off word
     /// timestamps (e.g. from inverse text normalization) don't drop real words.
-    private static func wordsWithSignal(
+    static func wordsWithSignal(
         _ words: [WordTiming], samples: [Float], sampleRate: Double = 16000
     ) -> [WordTiming] {
         let padding = 0.3
