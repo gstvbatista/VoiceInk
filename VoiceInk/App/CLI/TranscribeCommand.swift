@@ -46,8 +46,26 @@ enum TranscribeCommand {
         var extensions: Set<String>?
         var recursive = false
         var skipExisting = false
+        var jsonOutput = false
         var listModes = false
         var showHelp = false
+        var showVersion = false
+    }
+
+    // MARK: - Agent-friendly JSON events
+
+    private static let jsonSchemaVersion = "1.0"
+
+    /// Emits one deterministic JSON object per line on stdout (NDJSON).
+    /// stdout carries only these events in --json mode; stderr stays free
+    /// for human diagnostics, so agents can parse stdout line by line.
+    private static func emitEvent(_ event: String, _ fields: [String: Any] = [:]) {
+        var object: [String: Any] = ["event": event, "schema_version": jsonSchemaVersion]
+        for (key, value) in fields { object[key] = value }
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+            let line = String(data: data, encoding: .utf8)
+        else { return }
+        print(line)
     }
 
     private static let helpText = """
@@ -74,12 +92,24 @@ enum TranscribeCommand {
                                  cores for a single file, and each extra worker
                                  loads its own copy of the model — best gains
                                  come with cloud models or n of 2-3 locally.
+          --json                 Machine-readable mode for scripts and AI
+                                 agents: stdout becomes NDJSON — one JSON
+                                 event per line (start, file_started,
+                                 file_completed, file_failed, warning, error,
+                                 done), each with schema_version. Human
+                                 diagnostics stay on stderr.
           --list-modes           List available modes and exit
+          --version              Print app version and exit
           -h, --help             Show this help
+
+        Exit codes:
+          0  success (including "nothing to do")
+          1  usage or configuration error
+          2  finished, but one or more files failed
 
         Notes:
           - AI enhancement configured on the mode is skipped in CLI runs.
-          - json includes utterances and word-level timestamps when available.
+          - --format json includes utterances and word-level timestamps.
           - srt requires an engine with word timestamps (local whisper,
             Parakeet v2/v3, Nemotron, Apple Speech).
         """
@@ -145,6 +175,10 @@ enum TranscribeCommand {
                 options.recursive = true
             case "--skip-existing":
                 options.skipExisting = true
+            case "--json":
+                options.jsonOutput = true
+            case "--version":
+                options.showVersion = true
             default:
                 if argument.hasPrefix("-") {
                     throw TranscribeCommandError.usage("Unknown option: \(argument)")
@@ -164,8 +198,28 @@ enum TranscribeCommand {
         do {
             options = try parse(arguments)
         } catch {
-            fputs("error: \(error.localizedDescription)\n\n\(helpText)\n", stderr)
+            if arguments.contains("--json") {
+                emitEvent("error", ["error": error.localizedDescription])
+            } else {
+                fputs("error: \(error.localizedDescription)\n\n\(helpText)\n", stderr)
+            }
             return 1
+        }
+
+        func fail(_ message: String) -> Int32 {
+            if options.jsonOutput {
+                emitEvent("error", ["error": message])
+            } else {
+                fputs("error: \(message)\n", stderr)
+            }
+            return 1
+        }
+        func warn(_ message: String) {
+            if options.jsonOutput {
+                emitEvent("warning", ["message": message])
+            } else {
+                fputs("warning: \(message)\n", stderr)
+            }
         }
 
         if options.showHelp {
@@ -173,31 +227,44 @@ enum TranscribeCommand {
             return 0
         }
 
+        if options.showVersion {
+            let bundle = Bundle.main
+            let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+            let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+            if options.jsonOutput {
+                emitEvent("version", ["version": version, "build": build])
+            } else {
+                print("VoiceInk \(version) (\(build))")
+            }
+            return 0
+        }
+
         AppDefaults.registerDefaults()
 
         if options.listModes {
-            listModes()
+            listModes(json: options.jsonOutput)
             return 0
         }
 
         guard !options.inputs.isEmpty else {
-            fputs("error: no input files or folders\n\n\(helpText)\n", stderr)
-            return 1
+            return fail("no input files or folders")
         }
         let inputFiles: [URL]
         do {
             inputFiles = try collectInputFiles(
-                from: options.inputs, extensions: options.extensions, recursive: options.recursive)
+                from: options.inputs,
+                extensions: options.extensions,
+                recursive: options.recursive,
+                quiet: options.jsonOutput
+            )
         } catch {
-            fputs("error: \(error.localizedDescription)\n", stderr)
-            return 1
+            return fail(error.localizedDescription)
         }
         if let outputDirectory = options.outputDirectory {
             do {
                 try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
             } catch {
-                fputs("error: cannot create output directory: \(error.localizedDescription)\n", stderr)
-                return 1
+                return fail("cannot create output directory: \(error.localizedDescription)")
             }
         }
 
@@ -222,8 +289,7 @@ enum TranscribeCommand {
                     $0.name.localizedCaseInsensitiveCompare(modeName) == .orderedSame
                 })
             else {
-                fputs("error: no mode named \"\(modeName)\" — use --list-modes\n", stderr)
-                return 1
+                return fail("no mode named \"\(modeName)\" — use --list-modes")
             }
             mode = match
         } else {
@@ -233,8 +299,7 @@ enum TranscribeCommand {
         let resolution = ModeRuntimeResolver.transcriptionModelResolution(
             mode: mode, transcriptionModelManager: transcriptionModelManager)
         guard let configuration = ModeRuntimeResolver.transcriptionConfiguration(from: resolution) else {
-            fputs("error: \(resolutionFailureMessage(resolution))\n", stderr)
-            return 1
+            return fail(resolutionFailureMessage(resolution))
         }
 
         let diarizationMode = options.speakers ?? TranscribeDiarizationMode.current
@@ -242,12 +307,10 @@ enum TranscribeCommand {
             diarizationMode != .off
             && AudioTranscriptionManager.engineSupportsWordTimings(configuration.model)
         if diarizationMode != .off, !wantsSpeakers {
-            fputs(
-                "warning: \(configuration.model.displayName) produces no word timestamps; transcribing without speakers\n",
-                stderr)
+            warn("\(configuration.model.displayName) produces no word timestamps; transcribing without speakers")
         }
         if configuration.mode.isAIEnhancementEnabled {
-            fputs("warning: mode has AI enhancement enabled; enhancement is skipped in CLI runs\n", stderr)
+            warn("mode has AI enhancement enabled; enhancement is skipped in CLI runs")
         }
 
         let assignment = assignOutputURLs(
@@ -256,11 +319,15 @@ enum TranscribeCommand {
             outputDirectory: options.outputDirectory,
             skipExisting: options.skipExisting
         )
-        if assignment.skippedCount > 0 {
+        if assignment.skippedCount > 0, !options.jsonOutput {
             print("skipping \(assignment.skippedCount) file(s) with existing output")
         }
         guard !assignment.jobs.isEmpty else {
-            print("nothing to do — every input already has an output file")
+            if options.jsonOutput {
+                emitEvent("done", ["completed": 0, "failed": 0, "skipped": assignment.skippedCount])
+            } else {
+                print("nothing to do — every input already has an output file")
+            }
             return 0
         }
 
@@ -268,20 +335,35 @@ enum TranscribeCommand {
         let isLocalEngine = [.whisper, .fluidAudio, .transcribeCpp, .nativeApple].contains(
             configuration.model.provider)
         if workerCount > 1, isLocalEngine {
-            fputs(
-                "note: \(workerCount) workers with a local engine — each loads its own model copy (watch RAM); local engines already parallelize one file across cores, so gains are moderate\n",
-                stderr)
+            warn(
+                "\(workerCount) workers with a local engine — each loads its own model copy (watch RAM); local engines already parallelize one file across cores, so gains are moderate"
+            )
         }
 
         let dictionaryStorage = makeReadOnlyDictionaryStorage()
         if !dictionaryStorage.isReadOnlyStore {
-            fputs("warning: dictionary store unavailable; word replacements and custom vocabulary disabled\n", stderr)
+            warn("dictionary store unavailable; word replacements and custom vocabulary disabled")
         }
 
-        print("mode: \(configuration.mode.name)  model: \(configuration.model.displayName)")
-        print(
-            "language: \(configuration.language)  speakers: \(diarizationMode.rawValue)  format: \(options.format.rawValue)  jobs: \(workerCount)  files: \(assignment.jobs.count)"
-        )
+        if options.jsonOutput {
+            emitEvent(
+                "start",
+                [
+                    "mode": configuration.mode.name,
+                    "model": configuration.model.displayName,
+                    "language": configuration.language,
+                    "speakers": diarizationMode.rawValue,
+                    "format": options.format.rawValue,
+                    "jobs": workerCount,
+                    "files": assignment.jobs.count,
+                    "skipped": assignment.skippedCount,
+                ])
+        } else {
+            print("mode: \(configuration.mode.name)  model: \(configuration.model.displayName)")
+            print(
+                "language: \(configuration.language)  speakers: \(diarizationMode.rawValue)  format: \(options.format.rawValue)  jobs: \(workerCount)  files: \(assignment.jobs.count)"
+            )
+        }
 
         let jobs = assignment.jobs.enumerated().map { index, pair in
             TranscribeJob(index: index, file: pair.file, outputURL: pair.outputURL)
@@ -289,6 +371,7 @@ enum TranscribeCommand {
         let queue = TranscribeJobQueue(jobs: jobs)
         let totalFiles = jobs.count
         let format = options.format
+        let jsonOutput = options.jsonOutput
 
         let failures = await withTaskGroup(of: Int.self, returning: Int.self) { group in
             for _ in 0..<workerCount {
@@ -301,7 +384,8 @@ enum TranscribeCommand {
                         wantsSpeakers: wantsSpeakers,
                         format: format,
                         modelsDirectory: modelsDirectory,
-                        dictionaryContainer: dictionaryStorage.container
+                        dictionaryContainer: dictionaryStorage.container,
+                        jsonOutput: jsonOutput
                     )
                 }
             }
@@ -312,12 +396,20 @@ enum TranscribeCommand {
             return total
         }
 
-        if failures > 0 {
+        if options.jsonOutput {
+            emitEvent(
+                "done",
+                [
+                    "completed": totalFiles - failures,
+                    "failed": failures,
+                    "skipped": assignment.skippedCount,
+                ])
+        } else if failures > 0 {
             fputs("done with \(failures) failure(s)\n", stderr)
-            return 2
+        } else {
+            print("done")
         }
-        print("done")
-        return 0
+        return failures > 0 ? 2 : 0
     }
 
     // MARK: - Worker
@@ -354,7 +446,8 @@ enum TranscribeCommand {
         wantsSpeakers: Bool,
         format: OutputFormat,
         modelsDirectory: URL,
-        dictionaryContainer: ModelContainer
+        dictionaryContainer: ModelContainer,
+        jsonOutput: Bool
     ) async -> Int {
         let whisperManager = WhisperModelManager(modelsDirectory: modelsDirectory)
         whisperManager.loadAvailableModels()
@@ -380,7 +473,13 @@ enum TranscribeCommand {
         var failures = 0
         while let job = await queue.next() {
             let position = "[\(job.index + 1)/\(totalFiles)]"
-            print("\(position) transcribing \(job.file.lastPathComponent) ...")
+            if jsonOutput {
+                emitEvent(
+                    "file_started",
+                    ["index": job.index + 1, "total": totalFiles, "input": job.file.path])
+            } else {
+                print("\(position) transcribing \(job.file.lastPathComponent) ...")
+            }
             do {
                 let result = try await transcribeFile(
                     job.file,
@@ -398,10 +497,34 @@ enum TranscribeCommand {
                     configuration: configuration,
                     diarizationMode: diarizationMode
                 )
-                print("\(position) saved \(job.outputURL.path)")
+                if jsonOutput {
+                    emitEvent(
+                        "file_completed",
+                        [
+                            "index": job.index + 1,
+                            "total": totalFiles,
+                            "input": job.file.path,
+                            "output": job.outputURL.path,
+                            "duration_seconds": result.duration,
+                            "speakers_detected": Set((result.speakerUtterances ?? []).map(\.speaker)).count,
+                        ])
+                } else {
+                    print("\(position) saved \(job.outputURL.path)")
+                }
             } catch {
                 failures += 1
-                fputs("\(position) failed: \(job.file.lastPathComponent): \(error.localizedDescription)\n", stderr)
+                if jsonOutput {
+                    emitEvent(
+                        "file_failed",
+                        [
+                            "index": job.index + 1,
+                            "total": totalFiles,
+                            "input": job.file.path,
+                            "error": error.localizedDescription,
+                        ])
+                } else {
+                    fputs("\(position) failed: \(job.file.lastPathComponent): \(error.localizedDescription)\n", stderr)
+                }
             }
         }
 
@@ -411,9 +534,21 @@ enum TranscribeCommand {
     }
 
     @MainActor
-    private static func listModes() {
+    private static func listModes(json: Bool) {
         let manager = ModeManager.shared
         let activeId = manager.currentEffectiveConfiguration?.id
+        if json {
+            let modes = manager.configurations.map { config -> [String: Any] in
+                [
+                    "name": config.name,
+                    "enabled": config.isEnabled,
+                    "active": config.id == activeId,
+                    "model": config.selectedTranscriptionModelName ?? "",
+                ]
+            }
+            emitEvent("modes", ["modes": modes])
+            return
+        }
         if manager.configurations.isEmpty {
             print("no modes configured")
             return
@@ -607,7 +742,7 @@ enum TranscribeCommand {
     /// filtered by `--ext`, optionally recursive); explicit files are taken
     /// as-is after validation. Duplicates (same file reached twice) are dropped.
     private static func collectInputFiles(
-        from inputs: [URL], extensions: Set<String>?, recursive: Bool
+        from inputs: [URL], extensions: Set<String>?, recursive: Bool, quiet: Bool = false
     ) throws -> [URL] {
         let fileManager = FileManager.default
         var files: [URL] = []
@@ -631,7 +766,9 @@ enum TranscribeCommand {
                     let filterNote = extensions.map { " matching --ext \($0.sorted().joined(separator: ","))" } ?? ""
                     throw TranscribeCommandError.usage("no supported media files\(filterNote) in \(input.path)")
                 }
-                print("folder \(input.path): \(found.count) file(s)")
+                if !quiet {
+                    print("folder \(input.path): \(found.count) file(s)")
+                }
                 found.forEach(append)
             } else {
                 guard SupportedMedia.isSupported(url: input) else {
