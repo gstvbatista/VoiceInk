@@ -5,7 +5,6 @@ import OSLog
 import SwiftData
 import SwiftUI
 
-@main
 struct VoiceInkApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     let container: ModelContainer
